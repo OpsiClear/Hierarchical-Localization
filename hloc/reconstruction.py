@@ -64,15 +64,16 @@ def run_reconstruction(
     sfm_dir: Path,
     database_path: Path,
     image_dir: Path,
+    options: dict,
     verbose: bool = False,
-    options: Optional[Dict[str, Any]] = None,
 ) -> pycolmap.Reconstruction:
+
+
+    if "num_threads" not in options.keys():
+        raise ValueError("num_threads must be specified in options")
     models_path = sfm_dir / "models"
     models_path.mkdir(exist_ok=True, parents=True)
     logger.info("Running 3D reconstruction...")
-    if options is None:
-        options = {}
-    options = {"num_threads": min(multiprocessing.cpu_count(), 16), **options}
     with OutputCapture(verbose):
         with pycolmap.ostream():
             reconstructions = pycolmap.incremental_mapping(
@@ -143,7 +144,8 @@ def main(
     if not skip_geometric_verification:
         estimation_and_geometric_verification(database, pairs, verbose)
     reconstruction = run_reconstruction(
-        sfm_dir, database, image_dir, verbose, mapper_options
+        sfm_dir=sfm_dir, database_path=database, 
+        image_dir=image_dir, verbose=verbose, options=mapper_options
     )
     if reconstruction is not None:
         logger.info(
