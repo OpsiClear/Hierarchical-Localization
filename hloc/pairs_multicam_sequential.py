@@ -14,10 +14,17 @@ def generate_pairs(names: List[str], window_size: int = 2) -> List[tuple]:
     # Parse and organize images by camera
     cameras = {}
     for name in names:
-        camera_id = name.split('/')[0]
-        if camera_id not in cameras:
-            cameras[camera_id] = []
-        cameras[camera_id].append(name)
+        # Skip files that don't match our expected format
+        try:
+            camera_id = name.split('/')[0]
+            # Verify this is a valid frame by attempting to convert to int
+            frame_num = int(name.split('/')[-1].split('.')[0])
+            if camera_id not in cameras:
+                cameras[camera_id] = []
+            cameras[camera_id].append(name)
+        except (ValueError, IndexError):
+            logger.warning(f"Skipping invalid image name: {name}")
+            continue
     
     # Sort images within each camera
     for camera_id in cameras:
