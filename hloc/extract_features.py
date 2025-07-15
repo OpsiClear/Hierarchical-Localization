@@ -175,10 +175,18 @@ class ImageDataset(torch.utils.data.Dataset):
         "interpolation": "cv2_area",  # pil_linear is more accurate but slower
     }
 
-    def __init__(self, root, conf, paths=None, mask_dir: Optional[Path]=None):
+    def __init__(
+        self,
+        root,
+        conf,
+        paths=None,
+        mask_dir: Optional[Path] = None,
+        use_mask: bool = False,
+    ):
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
         self.root = root
         self.mask_dir = mask_dir
+        self.use_mask = use_mask
 
         if paths is None:
             paths = []
@@ -203,9 +211,44 @@ class ImageDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         name = self.names[idx]
-        image = read_image(self.root / name, self.conf.grayscale)
+        image_path = self.root / name
+        data = {}
+        mask_from_alpha = False
+
+        if self.use_mask:
+            if self.mask_dir:
+                mask_path = self.mask_dir / f"{name}.png"
+                if mask_path.exists():
+                    data["mask"] = read_image(mask_path, True)
+
+            if "mask" not in data:
+                # read image with alpha channel
+                img_unchanged = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+                if img_unchanged is None:
+                    raise ValueError(f"Cannot read image {image_path}.")
+
+                if len(img_unchanged.shape) == 3 and img_unchanged.shape[2] in [2, 4]:
+                    mask_from_alpha = True
+                    data["mask"] = img_unchanged[..., -1]
+                    if img_unchanged.shape[2] == 4:  # BGRA
+                        image = cv2.cvtColor(img_unchanged, cv2.COLOR_BGRA2RGB)
+                    else:  # Gray+Alpha
+                        image = img_unchanged[..., 0]
+                # BGR or Grayscale, needs conversion to RGB if not grayscale
+                elif len(img_unchanged.shape) == 3:
+                    image = cv2.cvtColor(img_unchanged, cv2.COLOR_BGR2RGB)
+                else:
+                    image = img_unchanged
+
+        if not mask_from_alpha:
+            image = read_image(self.root / name, self.conf.grayscale)
+
+        if self.conf.grayscale and len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
         image = image.astype(np.float32)
         size = image.shape[:2][::-1]
+        data["original_size"] = np.array(size)
 
         if self.conf.resize_max and (
             self.conf.resize_force or max(size) > self.conf.resize_max
@@ -213,21 +256,18 @@ class ImageDataset(torch.utils.data.Dataset):
             scale = self.conf.resize_max / max(size)
             size_new = tuple(int(round(x * scale)) for x in size)
             image = resize_image(image, size_new, self.conf.interpolation)
+            if "mask" in data and data["mask"] is not None:
+                data["mask"] = resize_image(data["mask"], size_new, "cv2_nearest")
 
         if self.conf.grayscale:
             image = image[None]
         else:
+            if len(image.shape) == 2:
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
             image = image.transpose((2, 0, 1))  # HxWxC to CxHxW
         image = image / 255.0
 
-        data = {
-            "image": image,
-            "original_size": np.array(size),
-        }
-        if self.mask_dir:
-            mask_path = self.mask_dir / f'{name}.png'
-            if mask_path.exists():
-                data['mask'] = read_image(mask_path, True)
+        data["image"] = image
         return data
 
     def __len__(self):
@@ -243,13 +283,16 @@ def main(
     image_list: Optional[Union[Path, List[str]]] = None,
     feature_path: Optional[Path] = None,
     overwrite: bool = False,
-    mask_dir: Optional[Path] = None
+    mask_dir: Optional[Path] = None,
+    use_mask: bool = False
 ) -> Path:
     logger.info(
         "Extracting local features with configuration:" f"\n{pprint.pformat(conf)}"
     )
 
-    dataset = ImageDataset(image_dir, conf["preprocessing"], image_list, mask_dir)
+    dataset = ImageDataset(
+        image_dir, conf["preprocessing"], image_list, mask_dir, use_mask
+    )
     if feature_path is None:
         feature_path = Path(export_dir, conf["output"] + ".h5")
     feature_path.parent.mkdir(exist_ok=True, parents=True)
@@ -282,12 +325,32 @@ def main(
                 pred["scales"] *= scales.mean()
             # add keypoint uncertainties scaled to the original resolution
             uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
-            if 'mask' in data:
-                mask = data['mask'][0] # cuz `batch_size == 1`
-                valid_keypoint = mask[pred['keypoints'][:, 1].astype('int'), pred['keypoints'][:, 0].astype('int')]
-                pred['keypoints'] = pred['keypoints'][valid_keypoint > 0]
-                pred['descriptors'] = pred['descriptors'][:, valid_keypoint > 0]
-                pred['scores'] = pred['scores'][valid_keypoint > 0]
+            if use_mask and "mask" in data and data["mask"] is not None:
+                mask = data["mask"][0].numpy()  # cuz `batch_size == 1`
+                # INTER_NEAREST resizing might be buggy and return a mask with different shape
+                if mask.shape != pred["keypoints"].shape[:2]:
+                    kpts_ij = np.round(pred["keypoints"][:, ::-1]).astype(int)
+                    if not (
+                        kpts_ij[:, 0].max() < mask.shape[1]
+                        and kpts_ij[:, 1].max() < mask.shape[0]
+                    ):
+                        mask = cv2.resize(
+                            mask,
+                            (kpts_ij[:, 0].max() + 1, kpts_ij[:, 1].max() + 1),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                kpts_ij = np.round(pred["keypoints"][:, ::-1]).astype(int)
+                valid = (
+                    (kpts_ij[:, 0] >= 0)
+                    & (kpts_ij[:, 0] < mask.shape[1])
+                    & (kpts_ij[:, 1] >= 0)
+                    & (kpts_ij[:, 1] < mask.shape[0])
+                )
+                valid_keypoint = mask[kpts_ij[valid, 1], kpts_ij[valid, 0]] > 127
+                valid[valid] = valid_keypoint
+                pred["keypoints"] = pred["keypoints"][valid]
+                pred["scores"] = pred["scores"][valid]
+                pred["descriptors"] = pred["descriptors"][:, valid]
 
         if as_half:
             for k in pred:
@@ -330,6 +393,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_list", type=Path)
     parser.add_argument("--feature_path", type=Path)
     parser.add_argument("--mask_dir", type=Path)
+    parser.add_argument("--use_mask", action="store_true")
     args = parser.parse_args()
     main(
         confs[args.conf],
@@ -339,4 +403,5 @@ if __name__ == "__main__":
         args.image_list,
         args.feature_path,
         args.mask_dir,
+        args.use_mask,
     )
