@@ -18,13 +18,6 @@ from .utils.base_model import dynamic_load
 from .utils.io import list_h5_names, read_image
 from .utils.parsers import parse_image_lists
 
-"""
-A set of standard configurations that can be directly selected from the command
-line using their name. Each is a dictionary with the following entries:
-    - output: the name of the feature file that will be generated.
-    - model: the model configuration, as passed to a feature extractor.
-    - preprocessing: how to preprocess the images read from disk.
-"""
 confs = {
     "superpoint_aachen": {
         "output": "feats-superpoint-n4096-r1024",
@@ -38,8 +31,6 @@ confs = {
             "resize_max": 1024,
         },
     },
-    # Resize images to 1600px even if they are originally smaller.
-    # Improves the keypoint localization if the images are of good quality.
     "superpoint_max": {
         "output": "feats-superpoint-n4096-rmax1600",
         "model": {
@@ -175,18 +166,9 @@ class ImageDataset(torch.utils.data.Dataset):
         "interpolation": "cv2_area",  # pil_linear is more accurate but slower
     }
 
-    def __init__(
-        self,
-        root,
-        conf,
-        paths=None,
-        mask_dir: Optional[Path] = None,
-        use_mask: bool = False,
-    ):
+    def __init__(self, root, conf, paths=None):
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
         self.root = root
-        self.mask_dir = mask_dir
-        self.use_mask = use_mask
 
         if paths is None:
             paths = []
@@ -211,44 +193,9 @@ class ImageDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         name = self.names[idx]
-        image_path = self.root / name
-        data = {}
-        mask_from_alpha = False
-
-        if self.use_mask:
-            if self.mask_dir:
-                mask_path = self.mask_dir / f"{name}.png"
-                if mask_path.exists():
-                    data["mask"] = read_image(mask_path, True)
-
-            if "mask" not in data:
-                # read image with alpha channel
-                img_unchanged = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-                if img_unchanged is None:
-                    raise ValueError(f"Cannot read image {image_path}.")
-
-                if len(img_unchanged.shape) == 3 and img_unchanged.shape[2] in [2, 4]:
-                    mask_from_alpha = True
-                    data["mask"] = img_unchanged[..., -1]
-                    if img_unchanged.shape[2] == 4:  # BGRA
-                        image = cv2.cvtColor(img_unchanged, cv2.COLOR_BGRA2RGB)
-                    else:  # Gray+Alpha
-                        image = img_unchanged[..., 0]
-                # BGR or Grayscale, needs conversion to RGB if not grayscale
-                elif len(img_unchanged.shape) == 3:
-                    image = cv2.cvtColor(img_unchanged, cv2.COLOR_BGR2RGB)
-                else:
-                    image = img_unchanged
-
-        if not mask_from_alpha:
-            image = read_image(self.root / name, self.conf.grayscale)
-
-        if self.conf.grayscale and len(image.shape) == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-
+        image = read_image(self.root / name, self.conf.grayscale)
         image = image.astype(np.float32)
         size = image.shape[:2][::-1]
-        data["original_size"] = np.array(size)
 
         if self.conf.resize_max and (
             self.conf.resize_force or max(size) > self.conf.resize_max
@@ -256,22 +203,57 @@ class ImageDataset(torch.utils.data.Dataset):
             scale = self.conf.resize_max / max(size)
             size_new = tuple(int(round(x * scale)) for x in size)
             image = resize_image(image, size_new, self.conf.interpolation)
-            if "mask" in data and data["mask"] is not None:
-                data["mask"] = resize_image(data["mask"], size_new, "cv2_nearest")
 
         if self.conf.grayscale:
             image = image[None]
         else:
-            if len(image.shape) == 2:
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
             image = image.transpose((2, 0, 1))  # HxWxC to CxHxW
         image = image / 255.0
 
-        data["image"] = image
+        data = {
+            "image": torch.from_numpy(image),
+            "original_size": np.array(size),
+        }
         return data
 
     def __len__(self):
         return len(self.names)
+
+
+class ImageDatasetWithMasks(ImageDataset):
+    def __init__(self, root, conf, mask_dir: Optional[Path] = None, paths=None):
+        super().__init__(root, conf, paths)
+        self.mask_dir = mask_dir
+
+    def __getitem__(self, idx):
+        # This part does the image loading and resizing from the parent class
+        data = super().__getitem__(idx)
+        name = self.names[idx]
+        
+        mask = None
+        # Get the original image size from the data dictionary
+        original_h, original_w = data['original_size'][1], data['original_size'][0]
+
+        if self.mask_dir:
+            mask_path = self.mask_dir / name
+            if mask_path.exists():
+                mask = read_image(mask_path, grayscale=True)
+            else: # If no mask file, create a pass-through one.
+                mask = np.ones((original_h, original_w), dtype=np.uint8) * 255
+        else:
+            # Use alpha channel. We need to read the original image again for this.
+            image_path = self.root / name
+            img_unchanged = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+            if img_unchanged is not None and len(img_unchanged.shape) == 3 and img_unchanged.shape[2] == 4:
+                mask = img_unchanged[..., 3]
+            else: # If no alpha channel, create a pass-through mask.
+                mask = np.ones((original_h, original_w), dtype=np.uint8) * 255
+        
+        if mask.shape[:2] != (original_h, original_w):
+             raise ValueError(f"Mask for {name} has shape {mask.shape[:2]} but image has shape {(original_h, original_w)}")
+
+        data['mask'] = torch.from_numpy(mask.astype(np.uint8))
+        return data
 
 
 @torch.no_grad()
@@ -283,16 +265,18 @@ def main(
     image_list: Optional[Union[Path, List[str]]] = None,
     feature_path: Optional[Path] = None,
     overwrite: bool = False,
+    use_mask: bool = False,
     mask_dir: Optional[Path] = None,
-    use_mask: bool = False
 ) -> Path:
     logger.info(
         "Extracting local features with configuration:" f"\n{pprint.pformat(conf)}"
     )
 
-    dataset = ImageDataset(
-        image_dir, conf["preprocessing"], image_list, mask_dir, use_mask
-    )
+    if use_mask:
+        dataset = ImageDatasetWithMasks(image_dir, conf["preprocessing"], mask_dir, image_list)
+    else:
+        dataset = ImageDataset(image_dir, conf["preprocessing"], image_list)
+
     if feature_path is None:
         feature_path = Path(export_dir, conf["output"] + ".h5")
     feature_path.parent.mkdir(exist_ok=True, parents=True)
@@ -317,40 +301,47 @@ def main(
         pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
 
         pred["image_size"] = original_size = data["original_size"][0].numpy()
+
         if "keypoints" in pred:
+            # Scale keypoints to original resolution FIRST
             size = np.array(data["image"].shape[-2:][::-1])
             scales = (original_size / size).astype(np.float32)
             pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
+
             if "scales" in pred:
                 pred["scales"] *= scales.mean()
-            # add keypoint uncertainties scaled to the original resolution
             uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
-            if use_mask and "mask" in data and data["mask"] is not None:
-                mask = data["mask"][0].numpy()  # cuz `batch_size == 1`
-                # INTER_NEAREST resizing might be buggy and return a mask with different shape
-                if mask.shape != pred["keypoints"].shape[:2]:
-                    kpts_ij = np.round(pred["keypoints"][:, ::-1]).astype(int)
-                    if not (
-                        kpts_ij[:, 0].max() < mask.shape[1]
-                        and kpts_ij[:, 1].max() < mask.shape[0]
-                    ):
-                        mask = cv2.resize(
-                            mask,
-                            (kpts_ij[:, 0].max() + 1, kpts_ij[:, 1].max() + 1),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                kpts_ij = np.round(pred["keypoints"][:, ::-1]).astype(int)
-                valid = (
-                    (kpts_ij[:, 0] >= 0)
-                    & (kpts_ij[:, 0] < mask.shape[1])
-                    & (kpts_ij[:, 1] >= 0)
-                    & (kpts_ij[:, 1] < mask.shape[0])
-                )
-                valid_keypoint = mask[kpts_ij[valid, 1], kpts_ij[valid, 0]] > 127
-                valid[valid] = valid_keypoint
-                pred["keypoints"] = pred["keypoints"][valid]
-                pred["scores"] = pred["scores"][valid]
-                pred["descriptors"] = pred["descriptors"][:, valid]
+
+            # Now, if we need to mask, filter the FULL RESOLUTION keypoints
+            if use_mask:
+                mask = data["mask"][0].cpu().numpy()
+                kpts = pred["keypoints"]
+                
+                kpts_ij = kpts[:, ::-1].astype(int)
+
+                h, w = mask.shape
+                
+                valid_bounds = (kpts_ij[:, 0] >= 0) & (kpts_ij[:, 0] < h) & \
+                               (kpts_ij[:, 1] >= 0) & (kpts_ij[:, 1] < w)
+                
+                is_valid = np.zeros(len(kpts), dtype=bool)
+                in_bounds_indices = np.where(valid_bounds)[0]
+                kpts_ij_to_check = kpts_ij[in_bounds_indices]
+                
+                mask_values = mask[kpts_ij_to_check[:, 0], kpts_ij_to_check[:, 1]]
+                positive_mask_indices = np.where(mask_values > 127)[0]
+
+                final_valid_indices = in_bounds_indices[positive_mask_indices]
+                is_valid[final_valid_indices] = True
+
+                for k in list(pred.keys()):
+                    if k.startswith('keypoint') or k == 'scales' or k == 'scores':
+                        pred[k] = pred[k][is_valid]
+                    elif k == 'descriptors':
+                        if pred[k].shape[-1] == len(is_valid):
+                            pred[k] = pred[k][..., is_valid]
+                        else:
+                            pred[k] = pred[k][is_valid]
 
         if as_half:
             for k in pred:
@@ -392,8 +383,8 @@ if __name__ == "__main__":
     parser.add_argument("--as_half", action="store_true")
     parser.add_argument("--image_list", type=Path)
     parser.add_argument("--feature_path", type=Path)
-    parser.add_argument("--mask_dir", type=Path)
     parser.add_argument("--use_mask", action="store_true")
+    parser.add_argument("--mask_dir", type=Path)
     args = parser.parse_args()
     main(
         confs[args.conf],
@@ -402,6 +393,7 @@ if __name__ == "__main__":
         args.as_half,
         args.image_list,
         args.feature_path,
-        args.mask_dir,
-        args.use_mask,
+        overwrite=True, # Default to overwrite for simplicity
+        use_mask=args.use_mask,
+        mask_dir=args.mask_dir,
     )

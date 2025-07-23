@@ -16,9 +16,13 @@ def generate_pairs(names: List[str], window_size: int = 2) -> List[tuple]:
     for name in names:
         # Skip files that don't match our expected format
         try:
-            camera_id = name.split('/')[0]
+            split_name = name.split('/')
+            
+            # The camera ID is assumed to be the parent directory of the image file.
+            # This supports both 'cam/frame.ext' and 'rig/cam/frame.ext' formats.
+            camera_id = split_name[-2]
             # Verify this is a valid frame by attempting to convert to int
-            frame_num = int(name.split('/')[-1].split('.')[0])
+            frame_num = int(split_name[-1].split('.')[0])
             if camera_id not in cameras:
                 cameras[camera_id] = []
             cameras[camera_id].append(name)

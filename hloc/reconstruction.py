@@ -35,18 +35,34 @@ def import_images(
     image_list: Optional[List[str]] = None,
     options: Optional[Dict[str, Any]] = None,
 ):
+    """
+    Imports images into the database, robustly filtering for valid image files.
+    """
     logger.info("Importing images into the database...")
     if options is None:
         options = {}
-    images = list(image_dir.iterdir())
-    if len(images) == 0:
-        raise IOError(f"No images found in {image_dir}.")
+
+    if image_list is None:
+        # Glob for common image extensions, ignoring system files like Thumbs.db
+        image_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
+        paths = []
+        for ext in image_extensions:
+            paths.extend(list(image_dir.rglob(f"*{ext}")))
+            paths.extend(list(image_dir.rglob(f"*{ext.upper()}")))
+        
+        if len(paths) == 0:
+            raise IOError(f"No valid images found in {image_dir}.")
+
+        # Create an image_list relative to the image_dir
+        image_list = [str(p.relative_to(image_dir)) for p in sorted(list(set(paths)))]
+        logger.info(f"Found {len(image_list)} valid images.")
+
     with pycolmap.ostream():
         pycolmap.import_images(
-            database_path,
-            image_dir,
-            camera_mode,
-            image_list=image_list or [],
+            database_path=str(database_path),
+            image_path=str(image_dir),
+            camera_mode=camera_mode,
+            image_names=image_list,  # Always use the clean list
             options=options,
         )
 
