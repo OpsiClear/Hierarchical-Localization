@@ -9,8 +9,7 @@ from typing import List, Optional, Union
 import os
 
 
-    
-def generate_pairs(names: List[str], window_size: int = 2) -> List[tuple]:
+def generate_pairs(names: List[str], window_size: int = 2, loop: bool = False) -> List[tuple]:
     # Parse and organize images by camera
     cameras = {}
     for name in names:
@@ -40,35 +39,67 @@ def generate_pairs(names: List[str], window_size: int = 2) -> List[tuple]:
     # Process each camera
     for i, camera_id in enumerate(camera_ids):
         camera_images = cameras[camera_id]
+        n_images = len(camera_images)
         
         # Generate pairs within the same camera
-        for j in range(len(camera_images)):
+        for j in range(n_images):
             current_img = camera_images[j]
-            # Match with future frames up to window_size
-            for k in range(j + 1, min(j + window_size + 1, len(camera_images))):
-                pairs.append((current_img, camera_images[k]))
+            
+            # Loop through potential future frames based on window_size
+            for k_offset in range(1, window_size + 1):
+                # Calculate the index for the candidate image
+                k = (j + k_offset) % n_images # Use modulo for looping
+                
+                # If looping is enabled, or if k is within the bounds (no loop)
+                if loop or (j + k_offset < n_images):
+                    candidate_img = camera_images[k]
+                    pairs.append((current_img, candidate_img))
             
             # Generate pairs with other cameras
             for other_camera_id in camera_ids[i + 1:]:
                 other_images = cameras[other_camera_id]
+                n_other_images = len(other_images)
+                
                 # Get current frame number
                 current_frame = int(current_img.split('/')[-1].split('.')[0])
                 
                 # Match with frames from current to current+window_size in other camera
-                for other_img in other_images:
+                for other_j in range(n_other_images):
+                    other_img = other_images[other_j]
                     other_frame = int(other_img.split('/')[-1].split('.')[0])
-                    if current_frame <= other_frame <= current_frame + window_size:
+                    
+                    # Calculate frame difference, considering looping if enabled
+                    frame_diff = other_frame - current_frame
+                    if loop:
+                        # Consider circular difference for looping
+                        if abs(frame_diff) <= window_size:
+                            pass # direct match
+                        elif current_frame > other_frame:
+                            # if current frame is later than other frame, check if other frame is near the end
+                            if n_images > 0 and (current_frame - (other_frame + n_images)) <= window_size:
+                                frame_diff = current_frame - (other_frame + n_images)
+                            elif n_other_images > 0 and (current_frame - (other_frame + n_other_images)) <= window_size:
+                                frame_diff = current_frame - (other_frame + n_other_images)
+
+                        elif current_frame < other_frame:
+                            # if other frame is later than current frame, check if current frame is near the end
+                            if n_images > 0 and ((current_frame + n_images) - other_frame) <= window_size:
+                                frame_diff = (current_frame + n_images) - other_frame
+                            elif n_other_images > 0 and ((current_frame + n_other_images) - other_frame) <= window_size:
+                                frame_diff = (current_frame + n_other_images) - other_frame
+                    
+                    if 0 <= frame_diff <= window_size:
                         pairs.append((current_img, other_img))
     
     return pairs
+
 
 def main(
     output: Path,
     image_list: Optional[Union[Path, List[str]]] = None,
     features: Optional[Path] = None,
-    ref_list: Optional[Union[Path, List[str]]] = None,
-    ref_features: Optional[Path] = None,
     window_size: int = 2,
+    loop: bool = False, 
 ):
     if image_list is not None:
         if isinstance(image_list, (str, Path)):
@@ -82,8 +113,8 @@ def main(
     else:
         raise ValueError("Provide either a list of images or a feature file.")
 
-    # Generate pairs with window constraint
-    pairs = generate_pairs(names, window_size)
+    # Generate pairs with window constraint and loop flag
+    pairs = generate_pairs(names, window_size, loop)
 
     logger.info(f"Found {len(pairs)} pairs.")
     with open(output, "w") as f:
@@ -95,6 +126,8 @@ if __name__ == "__main__":
     parser.add_argument("--image_list", type=Path)
     parser.add_argument("--features", type=Path)
     parser.add_argument("--window_size", type=int, default=2,
-                      help="Number of future frames to include in pairs")
+                        help="Number of future frames to include in pairs")
+    parser.add_argument("--loop", action="store_true",
+                        help="Allow matching first frame with last frame and so on (circular matching).") # Add loop argument
     args = parser.parse_args()
     main(**args.__dict__)
