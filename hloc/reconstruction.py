@@ -125,13 +125,6 @@ def run_reconstruction(
     models_path = sfm_dir / "models"
     models_path.mkdir(exist_ok=True, parents=True)
     logger.info("Running 3D reconstruction...")
-<<<<<<< HEAD
-=======
-    if options is None:
-        options = {}
-    options = {"num_threads": min(multiprocessing.cpu_count(), 16), **options}
-
->>>>>>> upstream/master
     with OutputCapture(verbose):
         reconstructions = incremental_mapping(
             database_path, image_dir, models_path, options=options
@@ -154,7 +147,6 @@ def run_reconstruction(
         f"Largest model is #{largest_index} " f"with {largest_num_images} images."
     )
 
-<<<<<<< HEAD
     # for filename in ["images.bin", "cameras.bin", "points3D.bin"]:
     #     if (sfm_dir / filename).exists():
     #         (sfm_dir / filename).unlink()
@@ -163,18 +155,6 @@ def run_reconstruction(
     # Changed from the original code to save the largest model
     reconstructions[largest_index].write_binary(sfm_dir)
 
-=======
-    for filename in [
-        "images.bin",
-        "cameras.bin",
-        "points3D.bin",
-        "frames.bin",
-        "rigs.bin",
-    ]:
-        if (sfm_dir / filename).exists():
-            (sfm_dir / filename).unlink()
-        shutil.move(str(models_path / str(largest_index) / filename), str(sfm_dir))
->>>>>>> upstream/master
     return reconstructions[largest_index]
 
 
